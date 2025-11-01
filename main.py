@@ -32,12 +32,21 @@ app.add_middleware(
 # Load YOLO model
 MODEL_PATH = "best.pt"  # Your custom trained model
 
-try:
-    model = YOLO(MODEL_PATH)
-    logger.info(f"✅ YOLO model loaded successfully from {MODEL_PATH}")
-except Exception as e:
-    logger.error(f"❌ Failed to load YOLO model: {e}")
-    model = None
+model = None
+
+
+@app.lifespan("startup")
+def load_model():
+    global model
+    try:
+        logger.info("🚀 Loading YOLO model on startup...")
+        model = YOLO(MODEL_PATH)
+        model.to("cpu")
+        logger.info(f"✅ YOLO model loaded successfully from {MODEL_PATH}")
+    except Exception as e:
+        logger.error(f"❌ Failed to load YOLO model: {e}")
+        model = None
+
 
 # Egyptian Artifact ID mapping - 84 classes from your data.yaml
 ARTIFACT_MAPPING = {
