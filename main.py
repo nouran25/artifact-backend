@@ -3,6 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 import os
 
+os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
