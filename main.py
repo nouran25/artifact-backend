@@ -31,9 +31,7 @@ app.add_middleware(
 MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
 
-REMOTE_URL = (
-    "https://huggingface.co/Nouran123/egyptian-artifact-yolo/resolve/main/best.pt"
-)
+REMOTE_URL = "https://huggingface.co/Nouran123/egyptian-artifact-yolo/resolve/main/best.pt?download=true"
 
 # Global model variable
 model = None
@@ -136,10 +134,12 @@ def ensure_model():
 
         Path(os.path.dirname(MODEL_PATH) or ".").mkdir(parents=True, exist_ok=True)
         print("📥 Downloading model from Hugging Face...")
-        r = requests.get(REMOTE_URL)
+        r = requests.get(REMOTE_URL, stream=True)
         r.raise_for_status()
         with open(MODEL_PATH, "wb") as f:
-            f.write(r.content)
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
         print("✅ Download complete!")
     return MODEL_PATH
 
