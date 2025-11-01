@@ -2,6 +2,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import os
+import requests
 
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -29,6 +30,8 @@ app.add_middleware(
 # Model configuration
 MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
+
+REMOTE_URL = "https://huggingface.co/Nouran123/egyptian-artifact-yolo/blob/main/best.pt"
 
 # Global model variable
 model = None
@@ -124,43 +127,34 @@ ARTIFACT_MAPPING = {
 }
 
 
+def ensure_model():
+    """Download model if not present locally"""
+    if not os.path.exists(MODEL_PATH):
+        from pathlib import Path
+
+        Path(os.path.dirname(MODEL_PATH) or ".").mkdir(parents=True, exist_ok=True)
+        print("📥 Downloading model from Hugging Face...")
+        r = requests.get(REMOTE_URL)
+        r.raise_for_status()
+        with open(MODEL_PATH, "wb") as f:
+            f.write(r.content)
+        print("✅ Download complete!")
+    return MODEL_PATH
+
+
 def load_model():
-    """Load YOLO model - with error handling"""
-    global model, model_loading, model_error
-
-    if model is not None:
-        return model
-
-    if model_loading:
-        return None
-
-    model_loading = True
-
+    global model
     try:
-        if not os.path.exists(MODEL_PATH):
-            error_msg = f"Model file not found at {MODEL_PATH}"
-            logger.error(f"❌ {error_msg}")
-            model_error = error_msg
-            return None
-
-        logger.info(f"🚀 Loading YOLO model from {MODEL_PATH}...")
         from ultralytics import YOLO
-        import cv2
-        import numpy as np
 
-        model = YOLO(MODEL_PATH)
-        model.to("cpu")  # Ensure CPU mode
-        logger.info("✅ YOLO model loaded successfully!")
-        model_error = None
+        model_path = ensure_model()
+        model = YOLO(model_path)
+        model.to("cpu")
+        print("✅ YOLO model loaded successfully!")
         return model
-
     except Exception as e:
-        error_msg = f"Failed to load model: {str(e)}"
-        logger.error(f"❌ {error_msg}")
-        model_error = error_msg
+        print(f"❌ Failed to load model: {e}")
         return None
-    finally:
-        model_loading = False
 
 
 @app.on_event("startup")
