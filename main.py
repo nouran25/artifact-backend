@@ -35,17 +35,29 @@ MODEL_PATH = "best.pt"  # Your custom trained model
 model = None
 
 
-@app.lifespan("startup")
-def load_model():
+def get_model():
     global model
-    try:
-        logger.info("🚀 Loading YOLO model on startup...")
-        model = YOLO(MODEL_PATH)
+    if model is None:
+        from ultralytics import YOLO
+
+        logger.info("🚀 Loading YOLO model on first use...")
+        model = YOLO("best.pt")
         model.to("cpu")
-        logger.info(f"✅ YOLO model loaded successfully from {MODEL_PATH}")
-    except Exception as e:
-        logger.error(f"❌ Failed to load YOLO model: {e}")
-        model = None
+        logger.info("✅ YOLO model ready!")
+    return model
+
+
+@app.on_event("startup")
+async def preload_model():
+    import threading
+
+    def load():
+        try:
+            get_model()
+        except Exception as e:
+            logger.error(f"Model preload failed: {e}")
+
+    threading.Thread(target=load).start()
 
 
 # Egyptian Artifact ID mapping - 84 classes from your data.yaml
@@ -168,6 +180,7 @@ async def detect_artifact(file: UploadFile = File(...)):
     """
 
     # Validate model is loaded
+    model = get_model()
     if model is None:
         raise HTTPException(
             status_code=503,
@@ -253,7 +266,7 @@ async def detect_artifact_detailed(file: UploadFile = File(...)):
     Returns:
         JSON with all detected artifacts, their bounding boxes, and confidence scores
     """
-
+    model = get_model()
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
