@@ -31,7 +31,9 @@ app.add_middleware(
 MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
 
-REMOTE_URL = "https://huggingface.co/Nouran123/egyptian-artifact-yolo/blob/main/best.pt"
+REMOTE_URL = (
+    "https://huggingface.co/Nouran123/egyptian-artifact-yolo/resolve/main/best.pt"
+)
 
 # Global model variable
 model = None
