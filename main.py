@@ -1,11 +1,7 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
-import cv2
-import numpy as np
-from io import BytesIO
-from PIL import Image
 import logging
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -21,46 +17,22 @@ app = FastAPI(
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://egyptian-museum-artifact-detection.vercel.app"
-    ],  # In production, replace with specific origins like ["http://localhost:3000"]
+    allow_origins=["*"],  # Allow all origins for now
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load YOLO model
-MODEL_PATH = "best.pt"  # Your custom trained model
+# Model configuration
+MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
 
+# Global model variable
 model = None
+model_loading = False
+model_error = None
 
-
-def get_model():
-    global model
-    if model is None:
-        from ultralytics import YOLO
-
-        logger.info("🚀 Loading YOLO model on first use...")
-        model = YOLO("best.pt")
-        model.to("cpu")
-        logger.info("✅ YOLO model ready!")
-    return model
-
-
-@app.on_event("startup")
-async def preload_model():
-    import threading
-
-    def load():
-        try:
-            get_model()
-        except Exception as e:
-            logger.error(f"Model preload failed: {e}")
-
-    threading.Thread(target=load).start()
-
-
-# Egyptian Artifact ID mapping - 84 classes from your data.yaml
+# Egyptian Artifact ID mapping - 84 classes
 ARTIFACT_MAPPING = {
     0: "Akhenaten",
     1: "Amenhotep III",
@@ -148,44 +120,107 @@ ARTIFACT_MAPPING = {
     83: "kneeling statue of queen hatshibsut",
 }
 
-# Confidence threshold for detection
-CONFIDENCE_THRESHOLD = 0.5
 
-logger.info(f"📋 Loaded {len(ARTIFACT_MAPPING)} Egyptian artifact classes")
+def load_model():
+    """Load YOLO model - with error handling"""
+    global model, model_loading, model_error
+
+    if model is not None:
+        return model
+
+    if model_loading:
+        return None
+
+    model_loading = True
+
+    try:
+        if not os.path.exists(MODEL_PATH):
+            error_msg = f"Model file not found at {MODEL_PATH}"
+            logger.error(f"❌ {error_msg}")
+            model_error = error_msg
+            return None
+
+        logger.info(f"🚀 Loading YOLO model from {MODEL_PATH}...")
+        from ultralytics import YOLO
+        import cv2
+        import numpy as np
+
+        model = YOLO(MODEL_PATH)
+        model.to("cpu")  # Ensure CPU mode
+        logger.info("✅ YOLO model loaded successfully!")
+        model_error = None
+        return model
+
+    except Exception as e:
+        error_msg = f"Failed to load model: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        model_error = error_msg
+        return None
+    finally:
+        model_loading = False
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize on startup - but don't block if model fails"""
+    logger.info("🚀 Starting Egyptian Museum Artifact Detection API...")
+    logger.info(f"📋 Loaded {len(ARTIFACT_MAPPING)} artifact classes")
+
+    # Try to load model in background
+    import threading
+
+    def load_in_background():
+        load_model()
+
+    threading.Thread(target=load_in_background, daemon=True).start()
+    logger.info("✅ API started - model loading in background")
 
 
 @app.get("/")
 async def root():
-    """Health check endpoint"""
+    """Health check endpoint - MUST succeed even if model not loaded"""
     return {
         "status": "online",
         "service": "Egyptian Museum Artifact Detection API",
         "model_loaded": model is not None,
+        "model_loading": model_loading,
+        "model_error": model_error,
         "model_path": MODEL_PATH,
         "num_artifacts": len(ARTIFACT_MAPPING),
         "confidence_threshold": CONFIDENCE_THRESHOLD,
     }
 
 
+@app.get("/health")
+async def health():
+    """Additional health check"""
+    return {"status": "healthy", "model_ready": model is not None}
+
+
 @app.post("/detect-artifact")
 async def detect_artifact(file: UploadFile = File(...)):
-    """
-    Detect Egyptian artifacts in uploaded images using YOLO
+    """Detect Egyptian artifacts in uploaded images using YOLO"""
 
-    Args:
-        file: Image file (JPG, PNG, etc.)
-
-    Returns:
-        JSON with artifact_id (artifact name) and confidence score
-    """
-
-    # Validate model is loaded
-    model = get_model()
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="YOLO model not loaded. Please check server configuration.",
-        )
+    # Check if model is ready
+    current_model = model
+    if current_model is None:
+        if model_loading:
+            raise HTTPException(
+                status_code=503,
+                detail="Model is still loading. Please try again in a few seconds.",
+            )
+        elif model_error:
+            raise HTTPException(
+                status_code=503, detail=f"Model failed to load: {model_error}"
+            )
+        else:
+            # Try to load now
+            current_model = load_model()
+            if current_model is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="YOLO model not available. Please check server logs.",
+                )
 
     # Validate file type
     if not file.content_type.startswith("image/"):
@@ -194,6 +229,9 @@ async def detect_artifact(file: UploadFile = File(...)):
         )
 
     try:
+        import cv2
+        import numpy as np
+
         # Read image file
         contents = await file.read()
         logger.info(f"📸 Received image: {file.filename} ({len(contents)} bytes)")
@@ -211,7 +249,7 @@ async def detect_artifact(file: UploadFile = File(...)):
         logger.info(f"🔍 Running inference on image shape: {image.shape}")
 
         # Run YOLO inference
-        results = model(image, conf=CONFIDENCE_THRESHOLD)
+        results = current_model(image, conf=CONFIDENCE_THRESHOLD)
 
         # Process results
         if len(results) == 0 or len(results[0].boxes) == 0:
@@ -219,7 +257,7 @@ async def detect_artifact(file: UploadFile = File(...)):
             return {
                 "artifact_id": None,
                 "confidence": 0.0,
-                "message": "No artifact detected in image. Try a clearer image or different angle.",
+                "message": "No artifact detected. Try a clearer image.",
             }
 
         # Get the detection with highest confidence
@@ -258,99 +296,22 @@ async def detect_artifact(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
 
 
-@app.post("/detect-artifact-detailed")
-async def detect_artifact_detailed(file: UploadFile = File(...)):
-    """
-    Detect artifacts with detailed information including all detections and bounding boxes
-
-    Returns:
-        JSON with all detected artifacts, their bounding boxes, and confidence scores
-    """
-    model = get_model()
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
-    try:
-        # Read and decode image
-        contents = await file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if image is None:
-            raise HTTPException(status_code=400, detail="Invalid image")
-
-        # Run inference
-        results = model(image, conf=CONFIDENCE_THRESHOLD)
-
-        if len(results) == 0 or len(results[0].boxes) == 0:
-            return {"detections": [], "count": 0, "message": "No artifacts detected"}
-
-        # Extract all detections
-        boxes = results[0].boxes
-        detections = []
-
-        for i in range(len(boxes)):
-            box = boxes[i]
-            class_id = int(box.cls.cpu().numpy()[0])
-            confidence = float(box.conf.cpu().numpy()[0])
-            bbox = box.xyxy.cpu().numpy()[0].tolist()  # [x1, y1, x2, y2]
-
-            artifact_name = ARTIFACT_MAPPING.get(
-                class_id, f"Unknown Artifact (Class {class_id})"
-            )
-
-            detections.append(
-                {
-                    "artifact_id": artifact_name,
-                    "confidence": confidence,
-                    "class_id": class_id,
-                    "bbox": {
-                        "x1": float(bbox[0]),
-                        "y1": float(bbox[1]),
-                        "x2": float(bbox[2]),
-                        "y2": float(bbox[3]),
-                    },
-                }
-            )
-
-        # Sort by confidence (highest first)
-        detections.sort(key=lambda x: x["confidence"], reverse=True)
-
-        logger.info(f"✅ Returned {len(detections)} detection(s)")
-
-        return {
-            "detections": detections,
-            "count": len(detections),
-            "image_shape": {
-                "height": image.shape[0],
-                "width": image.shape[1],
-                "channels": image.shape[2],
-            },
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Detailed detection failed: {str(e)}")
-        import traceback
-
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.get("/model-info")
 async def model_info():
-    """Get information about the loaded model and available artifacts"""
+    """Get information about the loaded model"""
     if model is None:
-        return {"loaded": False, "error": "Model not loaded"}
+        return {
+            "loaded": False,
+            "loading": model_loading,
+            "error": model_error,
+            "message": "Model not loaded yet",
+        }
 
     return {
         "loaded": True,
         "model_path": MODEL_PATH,
         "num_classes": len(ARTIFACT_MAPPING),
         "confidence_threshold": CONFIDENCE_THRESHOLD,
-        "model_type": str(type(model).__name__),
-        "sample_artifacts": list(ARTIFACT_MAPPING.values())[:10],  # Show first 10
         "total_artifacts": len(ARTIFACT_MAPPING),
     }
 
@@ -359,31 +320,10 @@ async def model_info():
 async def list_artifacts():
     """Get complete list of all detectable artifacts"""
     artifacts_list = [
-        {
-            "class_id": class_id,
-            "artifact_name": artifact_name,
-        }
+        {"class_id": class_id, "artifact_name": artifact_name}
         for class_id, artifact_name in ARTIFACT_MAPPING.items()
     ]
-
-    return {
-        "artifacts": artifacts_list,
-        "total": len(artifacts_list),
-    }
-
-
-@app.get("/artifacts/{class_id}")
-async def get_artifact(class_id: int):
-    """Get information about a specific artifact by class ID"""
-    if class_id not in ARTIFACT_MAPPING:
-        raise HTTPException(
-            status_code=404, detail=f"Artifact with class_id {class_id} not found"
-        )
-
-    return {
-        "class_id": class_id,
-        "artifact_name": ARTIFACT_MAPPING[class_id],
-    }
+    return {"artifacts": artifacts_list, "total": len(artifacts_list)}
 
 
 if __name__ == "__main__":
