@@ -3,8 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
 import os
-import requests
-from pathlib import Path
 import threading
 
 # CRITICAL: Set environment variables BEFORE any imports
@@ -15,12 +13,9 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Model configuration
-MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
+# Model configuration - LOCAL FILE
+MODEL_PATH = "best.pt"  # Model is in the same directory
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
-REMOTE_URL = (
-    "https://huggingface.co/Nouran123/egyptian-artifact-yolo/resolve/main/best.pt"
-)
 
 # Global model variable
 model = None
@@ -116,121 +111,34 @@ ARTIFACT_MAPPING = {
 }
 
 
-def ensure_model():
-    """Download model if not present locally with proper error handling"""
-    if not os.path.exists(MODEL_PATH):
-        Path(os.path.dirname(MODEL_PATH) or ".").mkdir(parents=True, exist_ok=True)
-        logger.info("📥 Downloading model from Hugging Face...")
-
-        try:
-            # Try multiple URL formats
-            urls_to_try = [
-                REMOTE_URL,
-                "https://huggingface.co/Nouran123/egyptian-artifact-yolo/resolve/main/best.pt?download=true",
-                f"https://huggingface.co/Nouran123/egyptian-artifact-yolo/blob/main/best.pt",
-            ]
-
-            for url in urls_to_try:
-                try:
-                    logger.info(f"Trying URL: {url}")
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        "Accept": "application/octet-stream, */*",
-                    }
-                    response = requests.get(
-                        url,
-                        headers=headers,
-                        stream=True,
-                        timeout=300,
-                        allow_redirects=True,
-                    )
-
-                    # Log response details
-                    logger.info(f"Response status: {response.status_code}")
-                    logger.info(
-                        f"Content-Type: {response.headers.get('content-type', 'unknown')}"
-                    )
-                    logger.info(f"Final URL after redirects: {response.url}")
-
-                    response.raise_for_status()
-
-                    content_type = response.headers.get("content-type", "")
-
-                    # Skip if HTML
-                    if "text/html" in content_type:
-                        logger.warning(
-                            f"Got HTML response from {url}, trying next URL..."
-                        )
-                        continue
-
-                    # Download the file
-                    total_size = int(response.headers.get("content-length", 0))
-                    logger.info(
-                        f"Downloading model ({total_size / 1024 / 1024:.2f} MB)..."
-                    )
-
-                    with open(MODEL_PATH, "wb") as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
-
-                    logger.info("✅ Download complete!")
-                    file_size = os.path.getsize(MODEL_PATH)
-                    logger.info(
-                        f"Downloaded model size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)"
-                    )
-
-                    # Verify it's a valid PyTorch file
-                    with open(MODEL_PATH, "rb") as f:
-                        header = f.read(100)
-                        logger.info(f"File header (first 20 bytes): {header[:20]}")
-
-                        # Check for PyTorch zip format (PK header)
-                        if not header.startswith(b"PK"):
-                            logger.warning(
-                                f"File doesn't start with PK (PyTorch zip format). Got: {header[:10]}"
-                            )
-                            if header.startswith(b"<html") or header.startswith(
-                                b"<!DOCT"
-                            ):
-                                logger.error("Downloaded file is HTML!")
-                                os.remove(MODEL_PATH)
-                                continue
-                            # Try anyway, might be a different format
-                        else:
-                            logger.info(
-                                "✅ File appears to be a valid PyTorch model (PK zip format)"
-                            )
-
-                    return MODEL_PATH
-
-                except Exception as e:
-                    logger.warning(f"Failed with URL {url}: {e}")
-                    if os.path.exists(MODEL_PATH):
-                        os.remove(MODEL_PATH)
-                    continue
-
-            # If we get here, all URLs failed
-            raise ValueError(
-                f"Failed to download model from all attempted URLs. Please check if the model exists at: {REMOTE_URL}"
-            )
-
-        except Exception as e:
-            if os.path.exists(MODEL_PATH):
-                os.remove(MODEL_PATH)
-            logger.error(f"Failed to download model: {e}")
-            raise
-    else:
-        logger.info(f"Model already exists at: {MODEL_PATH}")
-
-    return MODEL_PATH
-
-
 def load_model():
+    """Load YOLO model from local file"""
     global model, model_loading, model_error
     model_loading = True
 
     try:
+        # Check if model file exists
+        if not os.path.exists(MODEL_PATH):
+            error_msg = f"Model file not found: {MODEL_PATH}. Please ensure best.pt is in the same directory."
+            logger.error(f"❌ {error_msg}")
+            logger.info(f"Current directory: {os.getcwd()}")
+            logger.info(f"Files in directory: {os.listdir('.')}")
+            model_error = error_msg
+            model_loading = False
+            return None
+
+        # Log model file info
+        model_size = os.path.getsize(MODEL_PATH)
+        logger.info(f"📁 Found model file: {MODEL_PATH}")
+        logger.info(f"📊 Model size: {model_size / 1024 / 1024:.2f} MB")
+
+        # Verify it's a PyTorch file
+        with open(MODEL_PATH, "rb") as f:
+            header = f.read(20)
+            logger.info(f"🔍 File header: {header[:10]}")
+            if not header.startswith(b"PK"):
+                logger.warning("⚠️ File doesn't start with PK (PyTorch zip format)")
+
         # Patch torch.load to use weights_only=False BEFORE importing ultralytics
         import torch
 
@@ -247,10 +155,8 @@ def load_model():
         # Now import and load YOLO
         from ultralytics import YOLO
 
-        model_path = ensure_model()
-        logger.info(f"Loading model from: {model_path}")
-
-        model = YOLO(model_path)
+        logger.info(f"🔄 Loading YOLO model from: {MODEL_PATH}")
+        model = YOLO(MODEL_PATH)
         logger.info("✅ YOLO model loaded successfully!")
 
         # Restore original torch.load
@@ -263,6 +169,9 @@ def load_model():
     except Exception as e:
         error_msg = f"Failed to load model: {str(e)}"
         logger.error(f"❌ {error_msg}")
+        import traceback
+
+        logger.error(traceback.format_exc())
         model_error = error_msg
         model_loading = False
         return None
@@ -273,6 +182,8 @@ async def lifespan(app: FastAPI):
     """Initialize on startup and cleanup on shutdown"""
     logger.info("🚀 Starting Egyptian Museum Artifact Detection API...")
     logger.info(f"📋 Loaded {len(ARTIFACT_MAPPING)} artifact classes")
+    logger.info(f"📂 Current working directory: {os.getcwd()}")
+    logger.info(f"📁 Files in directory: {os.listdir('.')}")
 
     def load_in_background():
         load_model()
@@ -312,6 +223,8 @@ async def root():
         "model_loading": model_loading,
         "model_error": model_error,
         "model_path": MODEL_PATH,
+        "model_exists": os.path.exists(MODEL_PATH),
+        "current_directory": os.getcwd(),
         "num_artifacts": len(ARTIFACT_MAPPING),
         "confidence_threshold": CONFIDENCE_THRESHOLD,
     }
@@ -325,6 +238,7 @@ async def health():
         "model_ready": model is not None,
         "model_loading": model_loading,
         "model_error": model_error,
+        "model_exists": os.path.exists(MODEL_PATH),
     }
 
 
@@ -424,6 +338,7 @@ async def model_info():
             "loading": model_loading,
             "error": model_error,
             "message": "Model not loaded yet",
+            "model_exists": os.path.exists(MODEL_PATH),
         }
 
     return {
@@ -433,59 +348,6 @@ async def model_info():
         "confidence_threshold": CONFIDENCE_THRESHOLD,
         "total_artifacts": len(ARTIFACT_MAPPING),
     }
-
-
-@app.post("/upload-model")
-async def upload_model(file: UploadFile = File(...)):
-    """Manual model upload endpoint - use this if automatic download fails"""
-    global model, model_loading, model_error
-
-    if not file.filename.endswith(".pt"):
-        raise HTTPException(
-            status_code=400, detail="File must be a .pt PyTorch model file"
-        )
-
-    try:
-        logger.info(f"📤 Uploading model manually: {file.filename}")
-
-        # Save uploaded file
-        contents = await file.read()
-        with open(MODEL_PATH, "wb") as f:
-            f.write(contents)
-
-        file_size = os.path.getsize(MODEL_PATH)
-        logger.info(
-            f"Saved model: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)"
-        )
-
-        # Verify it's a PyTorch file
-        with open(MODEL_PATH, "rb") as f:
-            header = f.read(10)
-            if not header.startswith(b"PK"):
-                raise ValueError(
-                    "Uploaded file doesn't appear to be a valid PyTorch model"
-                )
-
-        # Try to load the model
-        model = None
-        model_error = None
-        load_model()
-
-        if model is not None:
-            return {
-                "success": True,
-                "message": "Model uploaded and loaded successfully!",
-                "model_size_mb": file_size / 1024 / 1024,
-            }
-        else:
-            return {
-                "success": False,
-                "message": f"Model uploaded but failed to load: {model_error}",
-            }
-
-    except Exception as e:
-        logger.error(f"Failed to upload model: {e}")
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
 @app.get("/artifacts")
