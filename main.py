@@ -1,22 +1,47 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import logging
 import os
 import requests
 from pathlib import Path
+import threading
 
+# CRITICAL: Set this BEFORE importing torch/ultralytics
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["TORCH_WEIGHTS_ONLY"] = "0"  # Allow loading YOLO weights
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize on startup and cleanup on shutdown"""
+    logger.info("🚀 Starting Egyptian Museum Artifact Detection API...")
+    logger.info(f"📋 Loaded {len(ARTIFACT_MAPPING)} artifact classes")
+
+    # Try to load model in background
+    def load_in_background():
+        load_model()
+
+    threading.Thread(target=load_in_background, daemon=True).start()
+    logger.info("✅ API started - model loading in background")
+
+    yield
+
+    # Cleanup (if needed)
+    logger.info("🛑 Shutting down API...")
+
+
+# Initialize FastAPI app with lifespan
 app = FastAPI(
     title="Egyptian Museum Artifact Detection API",
     description="YOLO-based artifact detection for Egyptian museum exhibits",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Configure CORS
