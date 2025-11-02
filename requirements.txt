@@ -1,17 +1,18 @@
 # Core Framework
-fastapi==0.120.4
-uvicorn[standard]==0.38.0
-opencv-python-headless==4.12.0.88
-python-multipart==0.0.20
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+opencv-python-headless==4.8.1.78
+python-multipart==0.0.6
 
 # YOLO (CPU-only, much smaller)
-ultralytics==8.3.223
+ultralytics==8.0.196
 
 # Image Processing (headless, no GUI)
-pillow==12.0.0
-numpy==2.2.6
+Pillow==10.1.0
+numpy==1.24.3
 
 # PyTorch CPU-only (MUCH smaller than CUDA version)
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.9.0+cpu
 torchvision==0.24.0+cpu
+requests==2.31.0

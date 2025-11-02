@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 import os
 import requests
+from pathlib import Path
 
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -21,7 +22,7 @@ app = FastAPI(
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for now
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,6 +32,7 @@ app.add_middleware(
 MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
 
+# Fixed Hugging Face URL - using direct download link
 REMOTE_URL = (
     "https://huggingface.co/Nouran123/egyptian-artifact-yolo/resolve/main/best.pt"
 )
@@ -130,44 +132,97 @@ ARTIFACT_MAPPING = {
 
 
 def ensure_model():
-    """Download model if not present locally"""
+    """Download model if not present locally with proper error handling"""
     if not os.path.exists(MODEL_PATH):
-        from pathlib import Path
-
         Path(os.path.dirname(MODEL_PATH) or ".").mkdir(parents=True, exist_ok=True)
-        print("📥 Downloading model from Hugging Face...")
-        r = requests.get(REMOTE_URL)
-        r.raise_for_status()
-        with open(MODEL_PATH, "wb") as f:
-            f.write(r.content)
-        print("✅ Download complete!")
-        print(f"Downloaded model size: {os.path.getsize(MODEL_PATH)} bytes")
-        with open(MODEL_PATH, "rb") as f:
-            print(f.read(10))  # Should not start with b'<html' or b'<!DOCT'
+        logger.info("📥 Downloading model from Hugging Face...")
+
+        try:
+            # Use headers to ensure we get the actual file
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+
+            response = requests.get(
+                REMOTE_URL, headers=headers, stream=True, timeout=300
+            )
+            response.raise_for_status()
+
+            # Check if we got HTML instead of binary
+            content_type = response.headers.get("content-type", "")
+            if "text/html" in content_type:
+                raise ValueError(
+                    f"Received HTML instead of model file. URL might be incorrect: {REMOTE_URL}"
+                )
+
+            # Download with progress
+            total_size = int(response.headers.get("content-length", 0))
+            logger.info(f"Downloading model ({total_size / 1024 / 1024:.2f} MB)...")
+
+            with open(MODEL_PATH, "wb") as f:
+                if total_size == 0:
+                    f.write(response.content)
+                else:
+                    downloaded = 0
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+
+            logger.info("✅ Download complete!")
+
+            # Verify the file is valid
+            file_size = os.path.getsize(MODEL_PATH)
+            logger.info(f"Downloaded model size: {file_size} bytes")
+
+            with open(MODEL_PATH, "rb") as f:
+                header = f.read(10)
+                logger.info(f"File header: {header}")
+
+                # Check if file starts with HTML tags (invalid)
+                if header.startswith(b"<html") or header.startswith(b"<!DOCT"):
+                    raise ValueError("Downloaded file is HTML, not a valid model file")
+
+            return MODEL_PATH
+
+        except Exception as e:
+            # Clean up invalid file
+            if os.path.exists(MODEL_PATH):
+                os.remove(MODEL_PATH)
+            logger.error(f"Failed to download model: {e}")
+            raise
+
     return MODEL_PATH
 
 
 def load_model():
-    global model
+    global model, model_loading, model_error
+    model_loading = True
+
     try:
         from ultralytics import YOLO
 
         model_path = ensure_model()
+        logger.info(f"Loading model from: {model_path}")
+
         model = YOLO(model_path)
-        # model.to("cpu")
-        print("✅ YOLO model loaded successfully!")
-        print(f"Downloaded model size: {os.path.getsize(MODEL_PATH)} bytes")
-        with open(MODEL_PATH, "rb") as f:
-            print(f.read(10))  # Should not start with b'<html' or b'<!DOCT'
+        logger.info("✅ YOLO model loaded successfully!")
+
+        model_loading = False
+        model_error = None
         return model
+
     except Exception as e:
-        print(f"❌ Failed to load model: {e}")
+        error_msg = f"Failed to load model: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        model_error = error_msg
+        model_loading = False
         return None
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize on startup - but don't block if model fails"""
+    """Initialize on startup - load model in background"""
     logger.info("🚀 Starting Egyptian Museum Artifact Detection API...")
     logger.info(f"📋 Loaded {len(ARTIFACT_MAPPING)} artifact classes")
 
@@ -183,7 +238,7 @@ async def startup_event():
 
 @app.get("/")
 async def root():
-    """Health check endpoint - MUST succeed even if model not loaded"""
+    """Health check endpoint"""
     return {
         "status": "online",
         "service": "Egyptian Museum Artifact Detection API",
@@ -199,7 +254,12 @@ async def root():
 @app.get("/health")
 async def health():
     """Additional health check"""
-    return {"status": "healthy", "model_ready": model is not None}
+    return {
+        "status": "healthy" if model is not None else "degraded",
+        "model_ready": model is not None,
+        "model_loading": model_loading,
+        "model_error": model_error,
+    }
 
 
 @app.post("/detect-artifact")
