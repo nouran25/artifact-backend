@@ -7,57 +7,17 @@ import requests
 from pathlib import Path
 import threading
 
-# CRITICAL: Set this BEFORE importing torch/ultralytics
+# CRITICAL: Set environment variables BEFORE any imports
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
-os.environ["TORCH_WEIGHTS_ONLY"] = "0"  # Allow loading YOLO weights
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialize on startup and cleanup on shutdown"""
-    logger.info("🚀 Starting Egyptian Museum Artifact Detection API...")
-    logger.info(f"📋 Loaded {len(ARTIFACT_MAPPING)} artifact classes")
-
-    # Try to load model in background
-    def load_in_background():
-        load_model()
-
-    threading.Thread(target=load_in_background, daemon=True).start()
-    logger.info("✅ API started - model loading in background")
-
-    yield
-
-    # Cleanup (if needed)
-    logger.info("🛑 Shutting down API...")
-
-
-# Initialize FastAPI app with lifespan
-app = FastAPI(
-    title="Egyptian Museum Artifact Detection API",
-    description="YOLO-based artifact detection for Egyptian museum exhibits",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Model configuration
 MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
-
-# Fixed Hugging Face URL - using direct download link
 REMOTE_URL = (
     "https://huggingface.co/Nouran123/egyptian-artifact-yolo/resolve/main/best.pt"
 )
@@ -163,24 +123,20 @@ def ensure_model():
         logger.info("📥 Downloading model from Hugging Face...")
 
         try:
-            # Use headers to ensure we get the actual file
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }
-
             response = requests.get(
                 REMOTE_URL, headers=headers, stream=True, timeout=300
             )
             response.raise_for_status()
 
-            # Check if we got HTML instead of binary
             content_type = response.headers.get("content-type", "")
             if "text/html" in content_type:
                 raise ValueError(
                     f"Received HTML instead of model file. URL might be incorrect: {REMOTE_URL}"
                 )
 
-            # Download with progress
             total_size = int(response.headers.get("content-length", 0))
             logger.info(f"Downloading model ({total_size / 1024 / 1024:.2f} MB)...")
 
@@ -188,30 +144,22 @@ def ensure_model():
                 if total_size == 0:
                     f.write(response.content)
                 else:
-                    downloaded = 0
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
-                            downloaded += len(chunk)
 
             logger.info("✅ Download complete!")
-
-            # Verify the file is valid
             file_size = os.path.getsize(MODEL_PATH)
             logger.info(f"Downloaded model size: {file_size} bytes")
 
             with open(MODEL_PATH, "rb") as f:
                 header = f.read(10)
-                logger.info(f"File header: {header}")
-
-                # Check if file starts with HTML tags (invalid)
                 if header.startswith(b"<html") or header.startswith(b"<!DOCT"):
                     raise ValueError("Downloaded file is HTML, not a valid model file")
 
             return MODEL_PATH
 
         except Exception as e:
-            # Clean up invalid file
             if os.path.exists(MODEL_PATH):
                 os.remove(MODEL_PATH)
             logger.error(f"Failed to download model: {e}")
@@ -225,6 +173,20 @@ def load_model():
     model_loading = True
 
     try:
+        # Patch torch.load to use weights_only=False BEFORE importing ultralytics
+        import torch
+
+        original_load = torch.load
+
+        def patched_load(*args, **kwargs):
+            # Force weights_only=False for YOLO model loading
+            kwargs["weights_only"] = False
+            return original_load(*args, **kwargs)
+
+        torch.load = patched_load
+        logger.info("✅ Patched torch.load to allow YOLO weights")
+
+        # Now import and load YOLO
         from ultralytics import YOLO
 
         model_path = ensure_model()
@@ -232,6 +194,9 @@ def load_model():
 
         model = YOLO(model_path)
         logger.info("✅ YOLO model loaded successfully!")
+
+        # Restore original torch.load
+        torch.load = original_load
 
         model_loading = False
         model_error = None
@@ -245,20 +210,38 @@ def load_model():
         return None
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize on startup - load model in background"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize on startup and cleanup on shutdown"""
     logger.info("🚀 Starting Egyptian Museum Artifact Detection API...")
     logger.info(f"📋 Loaded {len(ARTIFACT_MAPPING)} artifact classes")
-
-    # Try to load model in background
-    import threading
 
     def load_in_background():
         load_model()
 
     threading.Thread(target=load_in_background, daemon=True).start()
     logger.info("✅ API started - model loading in background")
+
+    yield
+    logger.info("🛑 Shutting down API...")
+
+
+# Initialize FastAPI app with lifespan
+app = FastAPI(
+    title="Egyptian Museum Artifact Detection API",
+    description="YOLO-based artifact detection for Egyptian museum exhibits",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
@@ -291,7 +274,6 @@ async def health():
 async def detect_artifact(file: UploadFile = File(...)):
     """Detect Egyptian artifacts in uploaded images using YOLO"""
 
-    # Check if model is ready
     current_model = model
     if current_model is None:
         if model_loading:
@@ -304,7 +286,6 @@ async def detect_artifact(file: UploadFile = File(...)):
                 status_code=503, detail=f"Model failed to load: {model_error}"
             )
         else:
-            # Try to load now
             current_model = load_model()
             if current_model is None:
                 raise HTTPException(
@@ -312,7 +293,6 @@ async def detect_artifact(file: UploadFile = File(...)):
                     detail="YOLO model not available. Please check server logs.",
                 )
 
-    # Validate file type
     if not file.content_type.startswith("image/"):
         raise HTTPException(
             status_code=400, detail="Invalid file type. Please upload an image."
@@ -322,11 +302,9 @@ async def detect_artifact(file: UploadFile = File(...)):
         import cv2
         import numpy as np
 
-        # Read image file
         contents = await file.read()
         logger.info(f"📸 Received image: {file.filename} ({len(contents)} bytes)")
 
-        # Convert to numpy array
         nparr = np.frombuffer(contents, np.uint8)
         image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -337,11 +315,8 @@ async def detect_artifact(file: UploadFile = File(...)):
             )
 
         logger.info(f"🔍 Running inference on image shape: {image.shape}")
-
-        # Run YOLO inference
         results = current_model(image, conf=CONFIDENCE_THRESHOLD)
 
-        # Process results
         if len(results) == 0 or len(results[0].boxes) == 0:
             logger.info("❌ No artifacts detected in image")
             return {
@@ -350,23 +325,19 @@ async def detect_artifact(file: UploadFile = File(...)):
                 "message": "No artifact detected. Try a clearer image.",
             }
 
-        # Get the detection with highest confidence
         boxes = results[0].boxes
         confidences = boxes.conf.cpu().numpy()
         classes = boxes.cls.cpu().numpy().astype(int)
 
         logger.info(f"📊 Found {len(boxes)} detection(s)")
 
-        # Find best detection
         best_idx = np.argmax(confidences)
         best_confidence = float(confidences[best_idx])
         best_class = int(classes[best_idx])
 
-        # Map class to artifact name
         artifact_name = ARTIFACT_MAPPING.get(
             best_class, f"Unknown Artifact (Class {best_class})"
         )
-
         logger.info(f"✅ Detected: {artifact_name} (confidence: {best_confidence:.2%})")
 
         return {
