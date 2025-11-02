@@ -123,47 +123,105 @@ def ensure_model():
         logger.info("📥 Downloading model from Hugging Face...")
 
         try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
-            response = requests.get(
-                REMOTE_URL, headers=headers, stream=True, timeout=300
+            # Try multiple URL formats
+            urls_to_try = [
+                REMOTE_URL,
+                "https://huggingface.co/Nouran123/egyptian-artifact-yolo/resolve/main/best.pt?download=true",
+                f"https://huggingface.co/Nouran123/egyptian-artifact-yolo/blob/main/best.pt",
+            ]
+
+            for url in urls_to_try:
+                try:
+                    logger.info(f"Trying URL: {url}")
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Accept": "application/octet-stream, */*",
+                    }
+                    response = requests.get(
+                        url,
+                        headers=headers,
+                        stream=True,
+                        timeout=300,
+                        allow_redirects=True,
+                    )
+
+                    # Log response details
+                    logger.info(f"Response status: {response.status_code}")
+                    logger.info(
+                        f"Content-Type: {response.headers.get('content-type', 'unknown')}"
+                    )
+                    logger.info(f"Final URL after redirects: {response.url}")
+
+                    response.raise_for_status()
+
+                    content_type = response.headers.get("content-type", "")
+
+                    # Skip if HTML
+                    if "text/html" in content_type:
+                        logger.warning(
+                            f"Got HTML response from {url}, trying next URL..."
+                        )
+                        continue
+
+                    # Download the file
+                    total_size = int(response.headers.get("content-length", 0))
+                    logger.info(
+                        f"Downloading model ({total_size / 1024 / 1024:.2f} MB)..."
+                    )
+
+                    with open(MODEL_PATH, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+
+                    logger.info("✅ Download complete!")
+                    file_size = os.path.getsize(MODEL_PATH)
+                    logger.info(
+                        f"Downloaded model size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)"
+                    )
+
+                    # Verify it's a valid PyTorch file
+                    with open(MODEL_PATH, "rb") as f:
+                        header = f.read(100)
+                        logger.info(f"File header (first 20 bytes): {header[:20]}")
+
+                        # Check for PyTorch zip format (PK header)
+                        if not header.startswith(b"PK"):
+                            logger.warning(
+                                f"File doesn't start with PK (PyTorch zip format). Got: {header[:10]}"
+                            )
+                            if header.startswith(b"<html") or header.startswith(
+                                b"<!DOCT"
+                            ):
+                                logger.error("Downloaded file is HTML!")
+                                os.remove(MODEL_PATH)
+                                continue
+                            # Try anyway, might be a different format
+                        else:
+                            logger.info(
+                                "✅ File appears to be a valid PyTorch model (PK zip format)"
+                            )
+
+                    return MODEL_PATH
+
+                except Exception as e:
+                    logger.warning(f"Failed with URL {url}: {e}")
+                    if os.path.exists(MODEL_PATH):
+                        os.remove(MODEL_PATH)
+                    continue
+
+            # If we get here, all URLs failed
+            raise ValueError(
+                f"Failed to download model from all attempted URLs. Please check if the model exists at: {REMOTE_URL}"
             )
-            response.raise_for_status()
-
-            content_type = response.headers.get("content-type", "")
-            if "text/html" in content_type:
-                raise ValueError(
-                    f"Received HTML instead of model file. URL might be incorrect: {REMOTE_URL}"
-                )
-
-            total_size = int(response.headers.get("content-length", 0))
-            logger.info(f"Downloading model ({total_size / 1024 / 1024:.2f} MB)...")
-
-            with open(MODEL_PATH, "wb") as f:
-                if total_size == 0:
-                    f.write(response.content)
-                else:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-
-            logger.info("✅ Download complete!")
-            file_size = os.path.getsize(MODEL_PATH)
-            logger.info(f"Downloaded model size: {file_size} bytes")
-
-            with open(MODEL_PATH, "rb") as f:
-                header = f.read(10)
-                if header.startswith(b"<html") or header.startswith(b"<!DOCT"):
-                    raise ValueError("Downloaded file is HTML, not a valid model file")
-
-            return MODEL_PATH
 
         except Exception as e:
             if os.path.exists(MODEL_PATH):
                 os.remove(MODEL_PATH)
             logger.error(f"Failed to download model: {e}")
             raise
+    else:
+        logger.info(f"Model already exists at: {MODEL_PATH}")
 
     return MODEL_PATH
 
@@ -375,6 +433,59 @@ async def model_info():
         "confidence_threshold": CONFIDENCE_THRESHOLD,
         "total_artifacts": len(ARTIFACT_MAPPING),
     }
+
+
+@app.post("/upload-model")
+async def upload_model(file: UploadFile = File(...)):
+    """Manual model upload endpoint - use this if automatic download fails"""
+    global model, model_loading, model_error
+
+    if not file.filename.endswith(".pt"):
+        raise HTTPException(
+            status_code=400, detail="File must be a .pt PyTorch model file"
+        )
+
+    try:
+        logger.info(f"📤 Uploading model manually: {file.filename}")
+
+        # Save uploaded file
+        contents = await file.read()
+        with open(MODEL_PATH, "wb") as f:
+            f.write(contents)
+
+        file_size = os.path.getsize(MODEL_PATH)
+        logger.info(
+            f"Saved model: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)"
+        )
+
+        # Verify it's a PyTorch file
+        with open(MODEL_PATH, "rb") as f:
+            header = f.read(10)
+            if not header.startswith(b"PK"):
+                raise ValueError(
+                    "Uploaded file doesn't appear to be a valid PyTorch model"
+                )
+
+        # Try to load the model
+        model = None
+        model_error = None
+        load_model()
+
+        if model is not None:
+            return {
+                "success": True,
+                "message": "Model uploaded and loaded successfully!",
+                "model_size_mb": file_size / 1024 / 1024,
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"Model uploaded but failed to load: {model_error}",
+            }
+
+    except Exception as e:
+        logger.error(f"Failed to upload model: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
 @app.get("/artifacts")
